@@ -1,9 +1,13 @@
-import joblib
+import json
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from huggingface_hub import hf_hub_download
 from PIL import Image, ImageFilter
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
 
 # ----------------------------------------------------------------------------
 # Configuración de la página
@@ -13,6 +17,9 @@ st.set_page_config(
     page_icon="🅿️",
     layout="wide",
 )
+
+N_MUESTRA = 60  # muestra reducida para que la app arranque rápido en Streamlit Cloud
+SEED = 42
 
 st.markdown(
     """
@@ -29,7 +36,7 @@ st.markdown(
 
 
 # ----------------------------------------------------------------------------
-# Extracción de características (para imágenes que suba el usuario en vivo)
+# Extracción de características
 # ----------------------------------------------------------------------------
 def extraer_features(img: Image.Image, points=None) -> dict:
     img = img.convert("RGB")
@@ -53,35 +60,79 @@ def extraer_features(img: Image.Image, points=None) -> dict:
 
 
 # ----------------------------------------------------------------------------
-# Carga del modelo y los datos ya procesados (rápido: nada se descarga aquí)
+# Descarga + entrenamiento (cacheado: solo corre una vez por arranque de la app)
 # ----------------------------------------------------------------------------
-@st.cache_resource
-def cargar_modelo():
-    return joblib.load("modelo.pkl")
+@st.cache_resource(show_spinner="Descargando muestra de PKLot y entrenando el modelo...")
+def entrenar_modelo(n_muestra: int = N_MUESTRA, seed: int = SEED):
+    path_samples = hf_hub_download("Voxel51/PKLot", "samples.json", repo_type="dataset")
+    with open(path_samples) as f:
+        samples = json.load(f)
+    lista_samples = samples["samples"] if isinstance(samples, dict) else samples
 
+    rows_img = []
+    for s in lista_samples:
+        rows_img.append(
+            {
+                "filepath": s["filepath"],
+                "source": s.get("source"),
+                "weather": (s.get("weather") or {}).get("label"),
+                "parking_spaces": (s.get("parking_spaces") or {}).get("polylines", []),
+            }
+        )
+    df_img = pd.DataFrame(rows_img)
+    muestra_imgs = df_img.sample(n=n_muestra, random_state=seed).reset_index(drop=True)
 
-@st.cache_data
-def cargar_datos():
-    return pd.read_csv("df_features.csv")
+    filas = []
+    for _, row in muestra_imgs.iterrows():
+        try:
+            ruta_local = hf_hub_download("Voxel51/PKLot", row["filepath"], repo_type="dataset")
+            img = Image.open(ruta_local)
+        except Exception:
+            continue
 
+        for p in row["parking_spaces"]:
+            status = p.get("occupancy_status")
+            if status not in ("occupied", "not occupied"):
+                continue
+            points = p.get("points", [[]])[0]
+            if not points or len(points) < 3:
+                continue
+            try:
+                feats = extraer_features(img, points)
+            except Exception:
+                continue
+            feats["occupied"] = 1 if status == "occupied" else 0
+            feats["weather"] = row["weather"]
+            feats["source"] = row["source"]
+            filas.append(feats)
 
-try:
-    modelo = cargar_modelo()
-    df_features = cargar_datos()
-except FileNotFoundError:
-    st.error(
-        "Faltan los archivos **modelo.pkl** y/o **df_features.csv** en la raíz del repo. "
-        "Corre `entrenar_y_exportar.py` en Colab y sube esos dos archivos junto a main.py."
+    df_features = pd.DataFrame(filas)
+
+    X = df_features[["brightness", "std_intensity", "edge_mean"]]
+    y = df_features["occupied"]
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=seed, stratify=y
     )
-    st.stop()
 
-df_test = df_features[df_features["conjunto"] == "test"].copy()
-y_test = df_test["occupied"].values
-y_proba_test = df_test["proba_ocupado"].values
-weather_test = df_test["weather"]
+    modelo = LogisticRegression()
+    modelo.fit(X_train, y_train)
+
+    df_features["pred"] = modelo.predict(X)
+    df_features["proba_ocupado"] = modelo.predict_proba(X)[:, 1]
+    df_features["correcto"] = np.where(
+        df_features["occupied"] == df_features["pred"], "Correcto", "Incorrecto"
+    )
+
+    y_proba_test = modelo.predict_proba(X_test)[:, 1]
+    weather_test = df_features.loc[X_test.index, "weather"]
+
+    return modelo, df_features, X_test, y_test, y_proba_test, weather_test
+
+
+modelo, df_features, X_test, y_test, y_proba_test, weather_test = entrenar_modelo()
 
 # ----------------------------------------------------------------------------
-# Sidebar: filtros globales (afectan Resumen y Explorar Datos)
+# Sidebar: filtros globales
 # ----------------------------------------------------------------------------
 st.sidebar.header("🎛️ Filtros del dashboard")
 
@@ -99,7 +150,7 @@ df_filtrado = df_features[
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
-    f"Modelo entrenado sobre una muestra del dataset PKLot "
+    f"Modelo entrenado con una muestra de **{N_MUESTRA} imágenes** del dataset PKLot "
     f"({len(df_features)} cajones analizados en total)."
 )
 
@@ -120,8 +171,7 @@ with tab_resumen:
     if df_filtrado.empty:
         st.warning("No hay datos para los filtros seleccionados. Ajusta los filtros en la barra lateral.")
     else:
-        acc_global = (y_proba_test >= 0.5).astype(int)
-        acc_global = (acc_global == y_test).mean()
+        acc_global = ((y_proba_test >= 0.5).astype(int) == y_test).mean()
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Cajones analizados", f"{len(df_filtrado):,}")
@@ -292,7 +342,6 @@ with tab_modelo:
     y_pred_umbral = (y_proba_test >= threshold).astype(int)
     acc = (y_pred_umbral == y_test).mean()
 
-    # Matriz de confusión manual (sin depender de sklearn.metrics aquí)
     vp = int(((y_pred_umbral == 1) & (y_test == 1)).sum())
     vn = int(((y_pred_umbral == 0) & (y_test == 0)).sum())
     fp = int(((y_pred_umbral == 1) & (y_test == 0)).sum())
@@ -394,4 +443,7 @@ adecuada para clasificación binaria.
             "característica de brillo."
         )
 
-    st.info(f"Modelo entrenado sobre una muestra de {len(df_features)} cajones del dataset PKLot.")
+    st.info(
+        f"Modelo entrenado en esta sesión con una muestra de {N_MUESTRA} imágenes "
+        f"del dataset PKLot."
+    )
