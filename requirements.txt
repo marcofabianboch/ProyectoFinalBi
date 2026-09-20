@@ -3,5 +3,5 @@ pandas
 numpy
 Pillow
 scikit-learn
-huggingface_hub
+joblib
 plotly
