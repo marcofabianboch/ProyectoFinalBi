@@ -1,14 +1,9 @@
-import json
-
+import joblib
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from huggingface_hub import hf_hub_download
 from PIL import Image, ImageFilter
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-from sklearn.model_selection import train_test_split
 
 # ----------------------------------------------------------------------------
 # Configuración de la página
@@ -18,9 +13,6 @@ st.set_page_config(
     page_icon="🅿️",
     layout="wide",
 )
-
-N_MUESTRA = 200  # misma muestra usada en el notebook original
-SEED = 42
 
 st.markdown(
     """
@@ -37,14 +29,11 @@ st.markdown(
 
 
 # ----------------------------------------------------------------------------
-# Extracción de características (misma lógica que en el notebook)
+# Extracción de características (para imágenes que suba el usuario en vivo)
 # ----------------------------------------------------------------------------
 def extraer_features(img: Image.Image, points=None) -> dict:
-    """Extrae brightness, std_intensity y edge_mean de una imagen (o de un
-    recorte definido por 'points', coordenadas normalizadas 0-1)."""
     img = img.convert("RGB")
     w, h = img.size
-
     if points:
         xs = [p[0] * w for p in points]
         ys = [p[1] * h for p in points]
@@ -52,12 +41,10 @@ def extraer_features(img: Image.Image, points=None) -> dict:
         recorte = img.crop(box)
     else:
         recorte = img
-
     recorte = recorte.resize((40, 40))
     gris = recorte.convert("L")
     arr = np.array(gris, dtype=float)
     bordes = np.array(gris.filter(ImageFilter.FIND_EDGES), dtype=float)
-
     return {
         "brightness": arr.mean(),
         "std_intensity": arr.std(),
@@ -66,79 +53,32 @@ def extraer_features(img: Image.Image, points=None) -> dict:
 
 
 # ----------------------------------------------------------------------------
-# Descarga de datos + entrenamiento del modelo (se cachea: solo corre una vez)
+# Carga del modelo y los datos ya procesados (rápido: nada se descarga aquí)
 # ----------------------------------------------------------------------------
-@st.cache_resource(
-    show_spinner="Descargando muestra del dataset PKLot y entrenando el modelo (1-2 min la primera vez)..."
-)
-def entrenar_modelo(n_muestra: int = N_MUESTRA, seed: int = SEED):
-    path_samples = hf_hub_download("Voxel51/PKLot", "samples.json", repo_type="dataset")
-    with open(path_samples) as f:
-        samples = json.load(f)
-    lista_samples = samples["samples"] if isinstance(samples, dict) else samples
+@st.cache_resource
+def cargar_modelo():
+    return joblib.load("modelo.pkl")
 
-    rows_img = []
-    for s in lista_samples:
-        rows_img.append(
-            {
-                "filepath": s["filepath"],
-                "source": s.get("source"),
-                "weather": (s.get("weather") or {}).get("label"),
-                "parking_spaces": (s.get("parking_spaces") or {}).get("polylines", []),
-            }
-        )
-    df_img = pd.DataFrame(rows_img)
-    muestra_imgs = df_img.sample(n=n_muestra, random_state=seed).reset_index(drop=True)
 
-    filas = []
-    for _, row in muestra_imgs.iterrows():
-        try:
-            ruta_local = hf_hub_download("Voxel51/PKLot", row["filepath"], repo_type="dataset")
-            img = Image.open(ruta_local)
-        except Exception:
-            continue
+@st.cache_data
+def cargar_datos():
+    return pd.read_csv("df_features.csv")
 
-        for p in row["parking_spaces"]:
-            status = p.get("occupancy_status")
-            if status not in ("occupied", "not occupied"):
-                continue
-            points = p.get("points", [[]])[0]
-            if not points or len(points) < 3:
-                continue
-            try:
-                feats = extraer_features(img, points)
-            except Exception:
-                continue
-            feats["occupied"] = 1 if status == "occupied" else 0
-            feats["weather"] = row["weather"]
-            feats["source"] = row["source"]
-            filas.append(feats)
 
-    df_features = pd.DataFrame(filas)
-
-    X = df_features[["brightness", "std_intensity", "edge_mean"]]
-    y = df_features["occupied"]
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=seed, stratify=y
+try:
+    modelo = cargar_modelo()
+    df_features = cargar_datos()
+except FileNotFoundError:
+    st.error(
+        "Faltan los archivos **modelo.pkl** y/o **df_features.csv** en la raíz del repo. "
+        "Corre `entrenar_y_exportar.py` en Colab y sube esos dos archivos junto a main.py."
     )
+    st.stop()
 
-    modelo = LogisticRegression()
-    modelo.fit(X_train, y_train)
-
-    # Predicciones sobre TODA la muestra, para poder explorarlas en el dashboard
-    df_features["pred"] = modelo.predict(X)
-    df_features["proba_ocupado"] = modelo.predict_proba(X)[:, 1]
-    df_features["correcto"] = np.where(
-        df_features["occupied"] == df_features["pred"], "Correcto", "Incorrecto"
-    )
-
-    y_proba_test = modelo.predict_proba(X_test)[:, 1]
-    weather_test = df_features.loc[X_test.index, "weather"]
-
-    return modelo, df_features, X_test, y_test, y_proba_test, weather_test
-
-
-modelo, df_features, X_test, y_test, y_proba_test, weather_test = entrenar_modelo()
+df_test = df_features[df_features["conjunto"] == "test"].copy()
+y_test = df_test["occupied"].values
+y_proba_test = df_test["proba_ocupado"].values
+weather_test = df_test["weather"]
 
 # ----------------------------------------------------------------------------
 # Sidebar: filtros globales (afectan Resumen y Explorar Datos)
@@ -159,7 +99,7 @@ df_filtrado = df_features[
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
-    f"Modelo entrenado con una muestra de **{N_MUESTRA} imágenes** del dataset PKLot "
+    f"Modelo entrenado sobre una muestra del dataset PKLot "
     f"({len(df_features)} cajones analizados en total)."
 )
 
@@ -180,7 +120,8 @@ with tab_resumen:
     if df_filtrado.empty:
         st.warning("No hay datos para los filtros seleccionados. Ajusta los filtros en la barra lateral.")
     else:
-        acc_global = accuracy_score(y_test, (y_proba_test >= 0.5).astype(int))
+        acc_global = (y_proba_test >= 0.5).astype(int)
+        acc_global = (acc_global == y_test).mean()
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Cajones analizados", f"{len(df_filtrado):,}")
@@ -349,17 +290,23 @@ with tab_modelo:
         0.0, 1.0, 0.5, 0.01,
     )
     y_pred_umbral = (y_proba_test >= threshold).astype(int)
-    acc = accuracy_score(y_test, y_pred_umbral)
-    cm = confusion_matrix(y_test, y_pred_umbral)
-    reporte = classification_report(
-        y_test, y_pred_umbral, target_names=["Vacío", "Ocupado"], output_dict=True, zero_division=0
-    )
+    acc = (y_pred_umbral == y_test).mean()
+
+    # Matriz de confusión manual (sin depender de sklearn.metrics aquí)
+    vp = int(((y_pred_umbral == 1) & (y_test == 1)).sum())
+    vn = int(((y_pred_umbral == 0) & (y_test == 0)).sum())
+    fp = int(((y_pred_umbral == 1) & (y_test == 0)).sum())
+    fn = int(((y_pred_umbral == 0) & (y_test == 1)).sum())
+    cm = np.array([[vn, fp], [fn, vp]])
+
+    precision_ocupado = vp / (vp + fp) if (vp + fp) > 0 else 0
+    recall_ocupado = vp / (vp + fn) if (vp + fn) > 0 else 0
 
     c1, c2 = st.columns(2)
     with c1:
         st.metric("Accuracy (test)", f"{acc*100:.1f}%")
-        st.write("**Reporte de clasificación:**")
-        st.dataframe(pd.DataFrame(reporte).transpose().round(3), use_container_width=True)
+        st.metric("Precision (Ocupado)", f"{precision_ocupado*100:.1f}%")
+        st.metric("Recall (Ocupado)", f"{recall_ocupado*100:.1f}%")
 
     with c2:
         st.write("**Matriz de confusión:**")
@@ -391,11 +338,11 @@ with tab_modelo:
 
     st.subheader("Accuracy por condición climática (con el umbral seleccionado)")
     df_test_clima = pd.DataFrame(
-        {"weather": weather_test.values, "real": y_test.values, "pred": y_pred_umbral}
+        {"weather": weather_test.values, "real": y_test, "pred": y_pred_umbral}
     )
     acc_clima = (
         df_test_clima.groupby("weather")
-        .apply(lambda g: accuracy_score(g["real"], g["pred"]), include_groups=False)
+        .apply(lambda g: (g["real"] == g["pred"]).mean(), include_groups=False)
         .reset_index()
     )
     acc_clima.columns = ["weather", "accuracy"]
@@ -447,7 +394,4 @@ adecuada para clasificación binaria.
             "característica de brillo."
         )
 
-    st.info(
-        f"Modelo entrenado en esta sesión con una muestra de {N_MUESTRA} imágenes "
-        f"del dataset PKLot."
-    )
+    st.info(f"Modelo entrenado sobre una muestra de {len(df_features)} cajones del dataset PKLot.")
